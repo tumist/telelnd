@@ -1,0 +1,17 @@
+0. Optionally set up virtualenv environment.
+1. These python packages need to be installed:
+   - python-telegram-bot
+   - qrencode
+   - qrcode
+   - zbar
+   - pillow
+   - sqlalchemy
+2. Create rpc_pb2.py and rpc_pb2_grpc according to
+   https://github.com/lightningnetwork/lnd/blob/master/docs/grpc/python.md
+   and copy to a this directory.
+3. Make sure lnd is run with the --no-macaroons option.
+   Macaroon support is a TODO
+4. Run wtih `$ BOT_TOKEN=12345ABC.... python app.py`
+5. Add yourself as a user
+   `$ echo 'INSERT INTO USERS (telegram_id) VALUES (61273859)' | sqlite3 database.sqlite`
+
