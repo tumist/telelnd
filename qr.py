@@ -13,7 +13,8 @@ def find_invoice(photo_file):
     if result == 0:
         return
     for symbol in zbar_image:
-        print(symbol)
+        #print(symbol)
+        pass
     data = symbol.data.decode('utf-8').lower()
     # TODO: Read up on lightnign QR invoice format
     if data.startswith("lightning:"):

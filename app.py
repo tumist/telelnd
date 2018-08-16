@@ -40,6 +40,8 @@ INVOICE_EXPIRE = 3600
 CERT_PATH = os.path.expanduser("~/.lnd/tls.cert")
 # lnd gRPC interface
 LND_GRPC = os.environ.get("LND", "localhost:10009")
+# Timeout in seconds
+GRPC_TIMEOUT = 60
 # SQLite3 database path
 DB_PATH = os.environ.get("DATABASE", "telelnd.db")
 
@@ -63,7 +65,9 @@ def decode_invoice(string):
     # amount so we don't either
     if not re.match("^ln(bc|tb)[0-9]+[munp]", string):
         return
-    return stub.DecodePayReq(ln.PayReqString(pay_req=string))
+    return stub.DecodePayReq(
+        ln.PayReqString(pay_req=string),
+        timeout=GRPC_TIMEOUT)
 
 # Command wrappers
 
@@ -116,6 +120,7 @@ def command_balance(user, session, bot, update):
     Show's the users balance
     """
     balance = db.get_balance(session, user)
+    logger.info("{} has balance {}".format(user, balance))
     update.message.reply_markdown(messages.balance(balance))
 
 @with_session
@@ -142,10 +147,12 @@ def command_invoice(user, session, bot, update, args=[]):
         return
     memo = u' '.join(args[1:])
     try:
-        added = stub.AddInvoice(ln.Invoice(value=amount, memo=memo, expiry=INVOICE_EXPIRE))
+        added = stub.AddInvoice(
+            ln.Invoice(value=amount, memo=memo, expiry=INVOICE_EXPIRE),
+            timeout=GRPC_TIMEOUT)
     except Exception, e:
         update.message.reply_markdown(messages.exception(e))
-        return
+        raise e
     logger.debug(added)
     payment_request = added.payment_request
     invoice = decode_invoice(payment_request)
@@ -170,23 +177,26 @@ def pay(user, session, bot, update, payment_request):
             return
     except Exception, e:
         update.message.reply_markdown(messages.exception(e))
-        return
+        raise e
     logger.debug(decode_payreq)
     satoshis = decode_payreq.num_satoshis
-    destinaton = decode_payreq.destination
+    destination = decode_payreq.destination
 
     if satoshis > db.get_balance(session, user):
         update.message.reply_text("Insufficient funds")
         return
 
-    # Commence payment
+    logger.info("{} initiating payment of {}".format(user, payment_request))
     update.message.reply_text("Sending payment...")
-    # XXX: This is a synchonous command, will block
-    ret = stub.SendPaymentSync(ln.SendRequest(payment_request=payment_request))
 
-    if ret.payment_error:
-        update.message.reply_text("Could not send payment: `{}`".format(ret.payment_error),
-                                  parse_mode=telegram.ParseMode.MARKDOWN)
+    # XXX: This is a synchonous command, will block until GRPC_TIMEOUT
+    try:
+        ret = stub.SendPaymentSync(
+            ln.SendRequest(payment_request=payment_request),
+            timeout=GRPC_TIMEOUT)
+    except Exception, e:
+        update.message.reply_markdown(messages.exception(e))
+        raise e
 
     if ret.payment_route \
         and ret.payment_route.total_amt > 0:
@@ -194,11 +204,18 @@ def pay(user, session, bot, update, payment_request):
         sent_amount = ret.payment_route.total_amt
         num_hops = len(ret.payment_route.hops)
         fee_amount = sent_amount - satoshis
-        logger.info("{} sent payment of {} satoshis".format(user, sent_amount))
+        logger.info("{} sent payment of {} satoshis to {}".format(user, sent_amount, destination))
         db.add_transaction(session, user, -sent_amount, payment_request)
         session.commit()
-
         update.message.reply_markdown(messages.payment_sent(sent_amount, fee_amount))
+    else:
+        if ret.payment_error:
+            update.message.reply_text("Could not send payment: `{}`".format(ret.payment_error),
+                                      parse_mode=telegram.ParseMode.MARKDOWN)
+            logger.info("Error paying {}: {}".format(payment_request, ret.payment_error))
+        else:
+            update.message.reply_text("Could not send payment")
+            logger.info("Error paying {}".format(payment_request))
 
 @with_session
 @with_user
@@ -230,15 +247,22 @@ def photo_handler(user, session, bot, update):
     photo_bytes = io.BytesIO()
     largest_photo.download(out=photo_bytes)
     photo_bytes.seek(0)
-    qr_invoice = qr.find_invoice(photo_bytes)
-    if qr_invoice:
-        update.message.reply_text("Found invoice `{}`".format(qr_invoice),
-                                  parse_mode=telegram.ParseMode.MARKDOWN)
-        db.set_invoice_context(session, user, qr_invoice, 60)
-        session.commit()
-        update.message.reply_text("Pay it using the /pay command")
-    else:
-        update.message.reply_text("No QR invoice found in this photo")
+    payment_request = qr.find_invoice(photo_bytes)
+    if not payment_request:
+        update.message.reply_text("Could not find a QR code in this image")
+        logger.info("No recognized data in photo from {}".format(user))
+        return
+    try:
+        invoice = decode_invoice(payment_request)
+    except Exception, e:
+        update.message.reply_markdown(messages.exception(e))
+        raise e
+    update.message.reply_text("I see your invoice")
+    update.message.reply_markdown(messages.invoice(payment_request, invoice))
+    db.set_invoice_context(session, user, payment_request, 60)
+    session.commit()
+    logger.info("{} sent photo with payment_request={}".format(user, payment_request))
+    update.message.reply_text("Pay it using the /pay command")
 
 @with_session
 @with_user
@@ -269,19 +293,17 @@ def help_handler(bot, update):
 # and handles accordingly.
 # TODO: There ought to be a way to do a scan of settled payments
 # to catch missed payments.
-
+# TODO: This does not survive any hiccups.
 def payments_listener_thread():
     logger.debug("payments_listener thread started")
-    request = ln.InvoiceSubscription()
-    for invoice in stub.SubscribeInvoices(request):
-        handle_payment(invoice)
+    for invoice in stub.SubscribeInvoices(ln.InvoiceSubscription()):
+        if hasattr(invoice, 'settled') and invoice.settled == True:
+            handle_payment(invoice)
     logger.critical("paymens_listener thread ended")
 
 @with_session
 def handle_payment(session, invoice):
-    logger.info("Incoming payment")
-    logger.info(invoice)
-
+    logger.debug("Incoming payment\n{}".format(invoice))
     try:
         amount = int(invoice.value)
         amount_str = str(amount)
@@ -295,13 +317,13 @@ def handle_payment(session, invoice):
     try:
         dbinv = session.query(db.Invoice).filter(db.Invoice.payment_request==invoice.payment_request).one()
     except: # sqlalchemy.orm.exc.NoResultFound
-        logger.info("Could not find this invoice in database")
+        logger.critical("Unable to find owner of settled invoice {}!".format(invoice.payment_request))
         return
-    logger.info("Invoice belongs to {}".format(dbinv.user))
     db.add_transaction(session, dbinv.user, amount, invoice.payment_request)
+    logger.info("Settled invoice {} for user {}".format(dbinv, dbinv.user))
     session.commit()
     # Notify owner of invoice
-    message = u"💵 Received *{}* for _invoice {}_".format(amount_str, memo)
+    message = u"💵 Received *{}* satoshis for invoice _{}_".format(amount_str, memo)
     updater.bot.send_message(chat_id=dbinv.user.telegram_id,
                              text=message, parse_mode=telegram.ParseMode.MARKDOWN)
 
@@ -328,7 +350,7 @@ def main():
     channel = grpc.secure_channel(LND_GRPC, creds)
     stub = lnrpc.LightningStub(channel)
     # Do a test call
-    info = stub.GetInfo(ln.GetInfoRequest())
+    info = stub.GetInfo(ln.GetInfoRequest(), timeout=GRPC_TIMEOUT)
     logger.info(info)
     logger.info("Connected to lnd".format(info.alias))
     if not info.testnet and TESTNET:
