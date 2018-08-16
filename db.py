@@ -100,11 +100,7 @@ class Invoice(Base):
 
 def open_database(path):
     from sqlalchemy import create_engine
-    engine = create_engine('sqlite:///' + path,
-                           echo=False,
-                           # this is needed to for mem sqlite + multithreading
-                           connect_args={'check_same_thread': False},
-                           poolclass=StaticPool)
+    engine = create_engine('sqlite:///' + path, echo=False)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
 
