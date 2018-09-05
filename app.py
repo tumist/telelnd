@@ -41,7 +41,7 @@ CERT_PATH = os.path.expanduser("~/.lnd/tls.cert")
 # lnd gRPC interface
 LND_GRPC = os.environ.get("LND", "localhost:10009")
 # Timeout in seconds
-GRPC_TIMEOUT = 60
+GRPC_TIMEOUT = 200
 # SQLite3 database path
 DB_PATH = os.environ.get("DATABASE", "telelnd.db")
 
